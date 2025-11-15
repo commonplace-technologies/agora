@@ -56,6 +56,227 @@ logger = logging.getLogger(__name__)
 
 
 # ============================================================================
+# GUTENBERG CATALOG CACHE
+# ============================================================================
+
+class GutenbergCatalog:
+    """
+    Local cache of the entire Project Gutenberg catalog.
+
+    Downloads the CSV catalog once (~20 MB) and provides instant local searches.
+    This eliminates rate limiting issues during the search phase.
+    """
+
+    CATALOG_URL = "https://www.gutenberg.org/cache/epub/feeds/pg_catalog.csv"
+    CACHE_LIFETIME_DAYS = 7
+
+    def __init__(self, cache_path: Path = Path("data/gutenberg_catalog.csv")):
+        self.cache_path = cache_path
+        self.catalog_by_author = {}  # author_normalized -> list of books
+        self.catalog_by_id = {}  # book_id -> book info
+        self._load_or_download()
+
+    def _is_stale(self) -> bool:
+        """Check if cached catalog is older than CACHE_LIFETIME_DAYS"""
+        if not self.cache_path.exists():
+            return True
+
+        file_age_days = (time.time() - self.cache_path.stat().st_mtime) / 86400
+        return file_age_days > self.CACHE_LIFETIME_DAYS
+
+    def _load_or_download(self):
+        """Download catalog if not cached or stale, then parse it"""
+        if self._is_stale():
+            logger.info("Downloading fresh Gutenberg catalog...")
+            self._download_catalog()
+        else:
+            logger.info("Using cached Gutenberg catalog")
+
+        self._parse_catalog()
+
+    def _download_catalog(self):
+        """Download the complete Gutenberg CSV catalog"""
+        try:
+            response = requests.get(self.CATALOG_URL, timeout=30)
+            response.raise_for_status()
+
+            self.cache_path.parent.mkdir(parents=True, exist_ok=True)
+
+            with open(self.cache_path, 'wb') as f:
+                f.write(response.content)
+
+            size_mb = len(response.content) / 1024 / 1024
+            logger.info(f"Downloaded Gutenberg catalog: {size_mb:.1f} MB")
+
+        except Exception as e:
+            logger.error(f"Failed to download Gutenberg catalog: {e}")
+            raise
+
+    def _parse_catalog(self):
+        """Parse CSV into searchable structures"""
+        try:
+            with open(self.cache_path, 'r', encoding='utf-8') as f:
+                reader = csv.DictReader(f)
+
+                for row in reader:
+                    # Skip non-text entries
+                    if row['Type'] != 'Text':
+                        continue
+
+                    # Skip if no author
+                    if not row.get('Authors'):
+                        continue
+
+                    # Parse book info
+                    book_id = row['Text#']
+                    book_info = {
+                        'id': book_id,
+                        'title': row['Title'],
+                        'author': row['Authors'],
+                        'language': row.get('Language', 'en'),
+                        'issued': row.get('Issued', ''),
+                    }
+
+                    # Index by book ID
+                    self.catalog_by_id[book_id] = book_info
+
+                    # Index by author (normalized)
+                    author_keys = self._normalize_author(row['Authors'])
+                    for author_key in author_keys:
+                        if author_key not in self.catalog_by_author:
+                            self.catalog_by_author[author_key] = []
+                        self.catalog_by_author[author_key].append(book_info)
+
+            logger.info(f"Loaded {len(self.catalog_by_id)} books from {len(self.catalog_by_author)} authors")
+
+        except Exception as e:
+            logger.error(f"Failed to parse Gutenberg catalog: {e}")
+            raise
+
+    def _normalize_author(self, author: str) -> List[str]:
+        """
+        Normalize author name for matching.
+        Returns multiple variations to improve match rate.
+
+        Example: "Marx, Karl, 1818-1883" -> ["marx", "karl marx", "marx karl"]
+        """
+        if not author:
+            return []
+
+        # Remove dates in parentheses or after comma-digits
+        author = re.sub(r',?\s*\d{4}-?\d{0,4}', '', author)
+
+        # Split on commas to handle "LastName, FirstName" format
+        parts = [p.strip() for p in author.split(',') if p.strip()]
+
+        normalized = []
+
+        # Add just last name
+        if parts:
+            normalized.append(re.sub(r'[^\w\s]', '', parts[0]).lower().strip())
+
+        # Add "FirstName LastName" format
+        if len(parts) >= 2:
+            first_last = f"{parts[1]} {parts[0]}"
+            normalized.append(re.sub(r'[^\w\s]', '', first_last).lower().strip())
+
+        # Add "LastName FirstName" format
+        if len(parts) >= 2:
+            last_first = f"{parts[0]} {parts[1]}"
+            normalized.append(re.sub(r'[^\w\s]', '', last_first).lower().strip())
+
+        # Deduplicate
+        return list(set(n for n in normalized if n))
+
+    def _normalize_title(self, title: str) -> str:
+        """Normalize title for fuzzy matching"""
+        # Remove subtitles (after colon or semicolon)
+        title = re.split(r'[;:]', title)[0]
+
+        # Remove common articles and normalize
+        title = re.sub(r'^(the|a|an)\s+', '', title.lower())
+        title = re.sub(r'[^\w\s]', '', title)
+
+        return title.strip()
+
+    def _title_similarity(self, title1: str, title2: str) -> float:
+        """Calculate title similarity (0.0 to 1.0)"""
+        norm1 = self._normalize_title(title1)
+        norm2 = self._normalize_title(title2)
+
+        # Exact match
+        if norm1 == norm2:
+            return 1.0
+
+        # One contains the other
+        if norm1 in norm2 or norm2 in norm1:
+            return 0.9
+
+        # Calculate word overlap
+        words1 = set(norm1.split())
+        words2 = set(norm2.split())
+
+        if not words1 or not words2:
+            return 0.0
+
+        overlap = len(words1 & words2)
+        total = len(words1 | words2)
+
+        return overlap / total if total > 0 else 0.0
+
+    def search_by_author_and_title(self, author: str, title: str, min_similarity: float = 0.7) -> Optional[Dict]:
+        """
+        Search for a book by author and title using local catalog.
+
+        Returns the best match or None if no good match found.
+        This is instant and requires no API calls!
+        """
+        # Normalize author name and get all variations
+        author_keys = self._normalize_author(author)
+
+        best_match = None
+        best_score = 0.0
+
+        # Search all author name variations
+        for author_key in author_keys:
+            if author_key in self.catalog_by_author:
+                for book in self.catalog_by_author[author_key]:
+                    similarity = self._title_similarity(book['title'], title)
+
+                    if similarity > best_score:
+                        best_score = similarity
+                        best_match = book
+
+        # Return best match if it meets minimum threshold
+        if best_match and best_score >= min_similarity:
+            return {
+                'id': best_match['id'],
+                'title': best_match['title'],
+                'author': best_match['author'],
+                'language': best_match['language'],
+                'similarity_score': best_score
+            }
+
+        return None
+
+    def get_all_books_by_author(self, author: str) -> List[Dict]:
+        """Get all books by an author (for debugging/exploration)"""
+        author_keys = self._normalize_author(author)
+
+        all_books = []
+        seen_ids = set()
+
+        for author_key in author_keys:
+            if author_key in self.catalog_by_author:
+                for book in self.catalog_by_author[author_key]:
+                    if book['id'] not in seen_ids:
+                        all_books.append(book)
+                        seen_ids.add(book['id'])
+
+        return all_books
+
+
+# ============================================================================
 # DATA MODELS
 # ============================================================================
 
@@ -279,10 +500,17 @@ class SourceAgent(ABC):
 
 
 class GutenbergAgent(SourceAgent):
-    """Expert agent for Project Gutenberg"""
+    """Expert agent for Project Gutenberg with local catalog cache"""
 
     GUTENBERG_API = "https://gutendex.com/books"
     GUTENBERG_MIRROR = "https://www.gutenberg.org"
+
+    def __init__(self, knowledge_base: SharedKnowledgeBase):
+        super().__init__(knowledge_base)
+        # Load entire Gutenberg catalog once (eliminates rate limiting during search!)
+        logger.info("Initializing Gutenberg catalog cache...")
+        self.catalog = GutenbergCatalog()
+        logger.info("Gutenberg catalog ready for instant local searches")
 
     def get_confidence_for_profile(self, profile: AuthorProfile) -> float:
         """Gutenberg is best for pre-1928 English texts"""
@@ -298,64 +526,101 @@ class GutenbergAgent(SourceAgent):
             return 0.5
 
     async def search(self, author: str, title: str, profile: AuthorProfile) -> SearchResult:
-        """Search Gutenberg"""
+        """
+        Search Gutenberg using local catalog (instant, no rate limits!).
+
+        This searches the cached CSV catalog locally instead of making API calls.
+        Much faster and eliminates all rate limiting issues.
+        """
         start_time = time.time()
 
-        # Check rate limiting
-        while await self.knowledge_base.should_rate_limit(self.source_name, 1.0):
-            await asyncio.sleep(0.5)
-
         try:
-            # Run API call in thread pool to avoid blocking
+            # Search local catalog (runs in thread pool to avoid blocking)
             loop = asyncio.get_event_loop()
-            result = await loop.run_in_executor(None, self._search_sync, author, title)
+            result = await loop.run_in_executor(
+                None,
+                self.catalog.search_by_author_and_title,
+                author,
+                title
+            )
 
             elapsed = (time.time() - start_time) * 1000
-            await self.knowledge_base.update_rate_limit(self.source_name)
 
             if result:
+                # Build URLs for downloading the text
+                book_id = result['id']
+
+                # Try multiple URL formats (Gutenberg has inconsistent paths)
+                download_urls = [
+                    f"https://www.gutenberg.org/files/{book_id}/{book_id}-0.txt",  # UTF-8 version
+                    f"https://www.gutenberg.org/files/{book_id}/{book_id}.txt",    # ASCII version
+                    f"https://www.gutenberg.org/cache/epub/{book_id}/pg{book_id}.txt",  # Cache version
+                ]
+
                 book = Book(
                     title=title,
                     author=author,
                     author_normalized=profile.normalized_id,
-                    source_id=result["id"],
-                    source_url=result["url"],
+                    source_id=book_id,
+                    source_url=download_urls[0],  # Will try all URLs in download()
                     source_name="gutenberg",
-                    confidence=0.9
+                    confidence=result['similarity_score']
                 )
-                await self.knowledge_base.record_search(self.source_name, author, title, True, result["id"])
-                return SearchResult(success=True, book=book, source_name="gutenberg", confidence=0.9, search_time_ms=elapsed)
+
+                # Store all URL variations for download phase
+                book.error = json.dumps({'download_urls': download_urls})  # Temporary storage
+
+                await self.knowledge_base.record_search(
+                    self.source_name, author, title, True, book_id
+                )
+
+                logger.debug(
+                    f"Found '{title}' by {author} in catalog "
+                    f"(ID: {book_id}, similarity: {result['similarity_score']:.2f})"
+                )
+
+                return SearchResult(
+                    success=True,
+                    book=book,
+                    source_name="gutenberg",
+                    confidence=result['similarity_score'],
+                    search_time_ms=elapsed
+                )
             else:
                 await self.knowledge_base.record_search(self.source_name, author, title, False)
+                logger.debug(f"Not found in catalog: '{title}' by {author}")
                 return SearchResult(success=False, source_name="gutenberg", search_time_ms=elapsed)
 
         except Exception as e:
-            logger.error(f"Gutenberg search error: {e}")
+            logger.error(f"Gutenberg catalog search error: {e}")
             await self.knowledge_base.record_search(self.source_name, author, title, False)
             return SearchResult(success=False, source_name="gutenberg", error=str(e))
 
-    def _search_sync(self, author: str, title: str) -> Optional[Dict]:
-        """Synchronous API search"""
-        try:
-            params = {'search': f"{author} {title}"}
-            response = self.session.get(self.GUTENBERG_API, params=params, timeout=10)
-
-            if response.status_code == 200:
-                data = response.json()
-                if data.get('results'):
-                    book = data['results'][0]
-                    # Find text/plain format
-                    for fmt, url in book.get('formats', {}).items():
-                        if 'text/plain' in fmt:
-                            return {"id": str(book['id']), "url": url}
-            return None
-        except Exception as e:
-            logger.debug(f"Gutenberg API error: {e}")
-            return None
-
     async def download(self, book: Book, output_dir: Path) -> bool:
-        """Download from Gutenberg"""
+        """
+        Download text file from Gutenberg.
+
+        Tries multiple URL formats and adds rate limiting to avoid
+        overwhelming the server during downloads.
+        """
         try:
+            # Extract download URLs from temporary storage
+            download_urls = []
+            if book.error:
+                try:
+                    data = json.loads(book.error)
+                    download_urls = data.get('download_urls', [])
+                except:
+                    pass
+
+            # Fallback to single URL if no variations stored
+            if not download_urls:
+                download_urls = [book.source_url]
+
+            # Rate limit downloads (be nice to Gutenberg!)
+            while await self.knowledge_base.should_rate_limit(self.source_name, 1.5):
+                await asyncio.sleep(0.5)
+
             author_dir = output_dir / book.author_normalized
             author_dir.mkdir(parents=True, exist_ok=True)
 
@@ -364,24 +629,47 @@ class GutenbergAgent(SourceAgent):
             filepath = author_dir / filename
 
             loop = asyncio.get_event_loop()
-            response = await loop.run_in_executor(
-                None,
-                lambda: self.session.get(book.source_url, timeout=30)
-            )
 
-            if response.status_code == 200:
-                with open(filepath, 'wb') as f:
-                    f.write(response.content)
+            # Try each URL format until one succeeds
+            last_error = None
+            for url in download_urls:
+                try:
+                    logger.debug(f"Trying download URL: {url}")
 
-                book.downloaded = True
-                book.download_path = str(filepath)
-                await self.knowledge_base.record_download(self.source_name)
-                logger.info(f"Downloaded: {filename}")
-                return True
+                    response = await loop.run_in_executor(
+                        None,
+                        lambda u=url: self.session.get(u, timeout=30)
+                    )
+
+                    if response.status_code == 200:
+                        with open(filepath, 'wb') as f:
+                            f.write(response.content)
+
+                        book.downloaded = True
+                        book.download_path = str(filepath)
+                        book.error = None  # Clear temporary storage
+
+                        await self.knowledge_base.record_download(self.source_name)
+                        await self.knowledge_base.update_rate_limit(self.source_name)
+
+                        size_kb = len(response.content) / 1024
+                        logger.info(f"Downloaded: {filename} ({size_kb:.1f} KB)")
+                        return True
+
+                    logger.debug(f"URL returned {response.status_code}: {url}")
+
+                except Exception as e:
+                    logger.debug(f"Failed to download from {url}: {e}")
+                    last_error = e
+                    continue
+
+            # All URLs failed
+            book.error = f"All download URLs failed. Last error: {last_error}"
+            logger.warning(f"Failed to download '{book.title}': {book.error}")
             return False
 
         except Exception as e:
-            logger.error(f"Download error: {e}")
+            logger.error(f"Download error for '{book.title}': {e}")
             book.error = str(e)
             return False
 
